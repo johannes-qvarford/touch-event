@@ -2,44 +2,65 @@ package com.johannesqvarford.touchevents.server
 
 import com.johannesqvarford.touchevents.protocol.InputStateMessage
 import com.johannesqvarford.touchevents.protocol.Server
-import java.awt.Robot
-import java.awt.event.InputEvent
+import java.io.IOException
 
-data class State(val x: Int, val y: Int, val held: Boolean)
+fun initiateServer(exchanger: MessageExchanger) {
+    val lock = Object()
+    var server: Server? = null
 
-fun main(args: Array<String>) {
-
-    var previousState = State(0, 0, false)
-
-    val server = Server()
-    val robot = Robot()
-    while (true) {
-
-        var currentState: State? = null
-        try {
-            val response = server.receive()
-            val message = response.message
-            when (message) {
-                is InputStateMessage -> currentState = State(message.x, message.y, message.held)
-            }
-        } catch (ex: Exception) {
-            println("Exception in server loop: $ex")
+    exchanger.addCallback<ServerStopRequested> {
+        synchronized(lock) {
+            server?.close()
+            server = null
         }
-
-        currentState?.let {
-            robot.mouseMove(it.x, it.y)
-            val pressed = !previousState.held && it.held
-            val released = previousState.held && !it.held
-
-            if (pressed) {
-                robot.mousePress(InputEvent.BUTTON1_MASK)
-            }
-            if (released) {
-                robot.mouseRelease(InputEvent.BUTTON1_MASK)
-            }
-            previousState = it
-        }
-
-        println("state: $currentState")
     }
+    exchanger.addCallback<ServerStartRequested> {
+        synchronized(lock) {
+            server?.close()
+            server = Server()
+            lock.notify()
+        }
+    }
+
+    val thread = Thread {
+        try {
+            while(true) {
+                var currentServer: Server?
+                synchronized(lock) {
+                    currentServer = server
+                    if (currentServer == null) {
+                        lock.wait()
+                    }
+                }
+
+                currentServer?.let {
+                    try {
+                        val response = it.receive()
+                        val message = response.message
+                        when (message) {
+                            is InputStateMessage -> exchanger.add(StateChanged(x = message.x, y = message.y, held = message.held))
+                        }
+                    } catch (ex: IOException) {
+                        ex.printStackTrace()
+                    }
+                }
+            }
+        } catch (ex: InterruptedException) {
+            return@Thread
+        }
+        finally {
+            synchronized(lock) {
+                server?.close()
+                server = null
+            }
+        }
+    }
+
+    exchanger.addCallback<ApplicationKillRequested> {
+        synchronized(lock) {
+            thread.interrupt()
+        }
+    }
+
+    thread.start()
 }
